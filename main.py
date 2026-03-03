@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, redirect, request, session, render_template_string
 
 # ================== ENV ==================
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("TOKEN")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
