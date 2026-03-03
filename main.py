@@ -1,38 +1,31 @@
 import os
 import discord
-import sqlite3
-import threading
-import requests
 from discord.ext import commands
 from datetime import datetime
-from flask import Flask, redirect, request, session, render_template_string
+import sqlite3
 
 # ================== ENV ==================
 TOKEN = os.getenv("TOKEN")
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")
-SECRET_KEY = os.getenv("SECRET_KEY")
+if not TOKEN:
+    raise Exception("Missing TOKEN environment variable.")
 
-if not all([TOKEN, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SECRET_KEY]):
-    raise Exception("Missing required environment variables.")
-
-# ================== DISCORD ==================
+# ================== DISCORD BOT ==================
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================== DATABASE ==================
-conn = sqlite3.connect("enterprise.db", check_same_thread=False)
+conn = sqlite3.connect("enterprise.db")
 cursor = conn.cursor()
 cursor.executescript("""
 CREATE TABLE IF NOT EXISTS whitelist(user TEXT);
 CREATE TABLE IF NOT EXISTS global_blacklist(user TEXT);
 CREATE TABLE IF NOT EXISTS logs(event TEXT, user TEXT, time TEXT);
 CREATE TABLE IF NOT EXISTS security(guild TEXT, level TEXT);
+CREATE TABLE IF NOT EXISTS muted(user TEXT, guild TEXT);
 """)
 conn.commit()
 
-# ================== UTIL ==================
+# ================== UTİL ==================
 raid_cache = {}
 action_cache = {}
 bot_join_cache = {}
@@ -42,11 +35,6 @@ def log(event, user):
                    (event, str(user), str(datetime.utcnow())))
     conn.commit()
 
-def get_security_level(guild_id):
-    cursor.execute("SELECT level FROM security WHERE guild=?", (guild_id,))
-    r = cursor.fetchone()
-    return r[0] if r else "medium"
-
 def is_whitelisted(user_id):
     cursor.execute("SELECT * FROM whitelist WHERE user=?", (str(user_id),))
     return cursor.fetchone() is not None
@@ -55,31 +43,27 @@ def is_global_blacklisted(user_id):
     cursor.execute("SELECT * FROM global_blacklist WHERE user=?", (str(user_id),))
     return cursor.fetchone() is not None
 
+def get_security_level(guild_id):
+    cursor.execute("SELECT level FROM security WHERE guild=?", (guild_id,))
+    r = cursor.fetchone()
+    return r[0] if r else "medium"
+
 # ================== EVENTS ==================
 @bot.event
 async def on_ready():
+    print(f"Enterprise Bot Online: {bot.user}")
     for guild in bot.guilds:
         await bot.tree.sync(guild=guild)
-    print(f"Enterprise Bot Online: {bot.user}")
 
 @bot.event
 async def on_member_join(member):
+    # Global blacklist
     if is_global_blacklisted(member.id):
         await member.ban(reason="Global Blacklist")
         return
-    gid = str(member.guild.id)
-    bot_join_cache.setdefault(gid, [])
-    if member.bot:
-        bot_join_cache[gid].append(datetime.utcnow())
-        if len(bot_join_cache[gid]) >= 5:
-            diff = (bot_join_cache[gid][-1] - bot_join_cache[gid][0]).seconds
-            if diff < 10:
-                for m in member.guild.members:
-                    if m.bot:
-                        await m.kick(reason="Bot Flood")
-                bot_join_cache[gid] = []
 
-    # Anti-Raid
+    # Anti-raid
+    gid = str(member.guild.id)
     raid_cache.setdefault(gid, [])
     raid_cache[gid].append(datetime.utcnow())
     if len(raid_cache[gid]) >= 5:
@@ -90,6 +74,18 @@ async def on_member_join(member):
             if member.guild.system_channel:
                 await member.guild.system_channel.send("Raid detected.")
             raid_cache[gid] = []
+
+    # Anti-bot flood
+    bot_join_cache.setdefault(gid, [])
+    if member.bot:
+        bot_join_cache[gid].append(datetime.utcnow())
+        if len(bot_join_cache[gid]) >= 5:
+            diff = (bot_join_cache[gid][-1] - bot_join_cache[gid][0]).seconds
+            if diff < 10:
+                for m in member.guild.members:
+                    if m.bot:
+                        await m.kick(reason="Bot Flood")
+                bot_join_cache[gid] = []
 
 # ================== ANTI-NUKE ==================
 async def handle_nuke(guild, user, action_type):
@@ -111,6 +107,7 @@ async def on_guild_channel_delete(channel):
     async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
         user = entry.user
         await handle_nuke(channel.guild, user, "ChannelDelete")
+        # Kanalı geri oluştur
         await channel.guild.create_text_channel(name=channel.name, category=channel.category)
         break
 
@@ -130,6 +127,13 @@ async def ban(interaction: discord.Interaction, member: discord.Member, reason: 
     await interaction.response.send_message("Banned.")
     log("Ban", interaction.user)
 
+@bot.tree.command(name="unban")
+async def unban(interaction: discord.Interaction, user_id: int):
+    user = await bot.fetch_user(user_id)
+    await interaction.guild.unban(user)
+    await interaction.response.send_message(f"{user} unbanned.")
+    log("Unban", interaction.user)
+
 @bot.tree.command(name="kick")
 async def kick(interaction: discord.Interaction, member: discord.Member, reason: str="No reason"):
     await member.kick(reason=reason)
@@ -139,14 +143,14 @@ async def kick(interaction: discord.Interaction, member: discord.Member, reason:
 @bot.tree.command(name="lockdown")
 async def lockdown(interaction: discord.Interaction):
     for c in interaction.guild.text_channels:
-        await c.set_permissions(interaction.guild.default_role, send_messages=False)
-    await interaction.response.send_message("Server locked.")
+        await c.set_permissions(interaction.guild.default_role, send_messages=False, view_channel=True)
+    await interaction.response.send_message("Server locked. Users can see channels but cannot write.")
     log("Lockdown", interaction.user)
 
 @bot.tree.command(name="unlock")
 async def unlock(interaction: discord.Interaction):
     for c in interaction.guild.text_channels:
-        await c.set_permissions(interaction.guild.default_role, send_messages=True)
+        await c.set_permissions(interaction.guild.default_role, send_messages=True, view_channel=True)
     await interaction.response.send_message("Server unlocked.")
     log("Unlock", interaction.user)
 
@@ -180,58 +184,26 @@ async def antiraid(interaction: discord.Interaction, state: str):
     await interaction.response.send_message(f"AntiRaid {state}")
     log("AntiRaid", interaction.user)
 
-# ================== DASHBOARD ==================
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
+@bot.tree.command(name="mute")
+async def mute(interaction: discord.Interaction, member: discord.Member):
+    muted_role = discord.utils.get(interaction.guild.roles, name="Muted")
+    if not muted_role:
+        muted_role = await interaction.guild.create_role(name="Muted")
+        for c in interaction.guild.channels:
+            await c.set_permissions(muted_role, send_messages=False)
+    await member.add_roles(muted_role)
+    cursor.execute("INSERT INTO muted VALUES (?,?)", (str(member.id), str(interaction.guild.id)))
+    conn.commit()
+    await interaction.response.send_message(f"{member} muted.")
 
-@app.route("/")
-def home():
-    if "user" not in session:
-        return redirect("/login")
-    cursor.execute("SELECT * FROM logs ORDER BY time DESC")
-    logs = cursor.fetchall()
-    return render_template_string("""
-    <h1>Atlas Enterprise Dashboard</h1>
-    <a href='/logout'>Logout</a>
-    <hr>
-    {% for l in logs %}
-        <p>{{l}}</p>
-    {% endfor %}
-    """, logs=logs)
-
-@app.route("/login")
-def login():
-    url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds"
-    return redirect(url)
-
-@app.route("/callback")
-def callback():
-    code = request.args.get("code")
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    r = requests.post("https://discord.com/api/oauth2/token", data=data, headers=headers)
-    token = r.json().get("access_token")
-    user = requests.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {token}"}).json()
-    session["user"] = user
-    return redirect("/")
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/")
+@bot.tree.command(name="unmute")
+async def unmute(interaction: discord.Interaction, member: discord.Member):
+    muted_role = discord.utils.get(interaction.guild.roles, name="Muted")
+    if muted_role:
+        await member.remove_roles(muted_role)
+    cursor.execute("DELETE FROM muted WHERE user=? AND guild=?", (str(member.id), str(interaction.guild.id)))
+    conn.commit()
+    await interaction.response.send_message(f"{member} unmuted.")
 
 # ================== RUN ==================
-def run_bot():
-    bot.run(TOKEN)
-
-threading.Thread(target=run_bot).start()
-
-if __name__ == "__main__":
-    # Flask ana thread olarak çalışsın
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+bot.run(TOKEN)
