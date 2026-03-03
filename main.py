@@ -4,7 +4,7 @@ import sqlite3
 import threading
 import requests
 from discord.ext import commands
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, redirect, request, session, render_template_string
 
 # ================== ENV ==================
@@ -25,7 +25,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 conn = sqlite3.connect("enterprise.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.executescript("""
-CREATE TABLE IF NOT EXISTS warnings(guild TEXT, user TEXT, reason TEXT);
 CREATE TABLE IF NOT EXISTS whitelist(user TEXT);
 CREATE TABLE IF NOT EXISTS global_blacklist(user TEXT);
 CREATE TABLE IF NOT EXISTS logs(event TEXT, user TEXT, time TEXT);
@@ -59,22 +58,18 @@ def is_global_blacklisted(user_id):
 # ================== EVENTS ==================
 @bot.event
 async def on_ready():
-    # Guild scoped sync (hızlı slash komut)
     for guild in bot.guilds:
         await bot.tree.sync(guild=guild)
     print(f"Enterprise Bot Online: {bot.user}")
 
 @bot.event
 async def on_member_join(member):
-    # Global Blacklist
     if is_global_blacklisted(member.id):
         await member.ban(reason="Global Blacklist")
         return
-
-    # Anti Bot Flood
+    gid = str(member.guild.id)
+    bot_join_cache.setdefault(gid, [])
     if member.bot:
-        gid = str(member.guild.id)
-        bot_join_cache.setdefault(gid, [])
         bot_join_cache[gid].append(datetime.utcnow())
         if len(bot_join_cache[gid]) >= 5:
             diff = (bot_join_cache[gid][-1] - bot_join_cache[gid][0]).seconds
@@ -85,7 +80,6 @@ async def on_member_join(member):
                 bot_join_cache[gid] = []
 
     # Anti-Raid
-    gid = str(member.guild.id)
     raid_cache.setdefault(gid, [])
     raid_cache[gid].append(datetime.utcnow())
     if len(raid_cache[gid]) >= 5:
@@ -93,7 +87,8 @@ async def on_member_join(member):
         if diff < 10:
             for channel in member.guild.text_channels:
                 await channel.edit(slowmode_delay=15)
-            await member.guild.system_channel.send("Raid detected.")
+            if member.guild.system_channel:
+                await member.guild.system_channel.send("Raid detected.")
             raid_cache[gid] = []
 
 # ================== ANTI-NUKE ==================
@@ -116,7 +111,6 @@ async def on_guild_channel_delete(channel):
     async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
         user = entry.user
         await handle_nuke(channel.guild, user, "ChannelDelete")
-        # Auto Restore
         await channel.guild.create_text_channel(name=channel.name, category=channel.category)
         break
 
@@ -239,4 +233,5 @@ def run_bot():
 threading.Thread(target=run_bot).start()
 
 if __name__ == "__main__":
+    # Flask ana thread olarak çalışsın
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
