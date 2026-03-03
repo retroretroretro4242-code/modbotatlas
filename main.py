@@ -8,7 +8,7 @@ from discord.ext import commands
 from datetime import timedelta
 import threading
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("TOKEN")
 
 if not TOKEN:
     raise Exception("DISCORD_TOKEN environment variable not set.")
